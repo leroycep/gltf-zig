@@ -137,6 +137,18 @@ pub const Accessor = struct {
         MAT2,
         MAT3,
         MAT4,
+
+        pub fn size(self: @This()) usize {
+            return switch (self) {
+                .SCALAR => 1,
+                .VEC2 => 2,
+                .VEC3 => 3,
+                .VEC4 => 4,
+                .MAT2 => 4,
+                .MAT3 => 9,
+                .MAT4 => 16,
+            };
+        }
     },
 
     /// Maximum value of each component in this attribute. Array elements must be treated as having

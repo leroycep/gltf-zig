@@ -1,7 +1,6 @@
 const std = @import("std");
-const json = @import("./json.zig");
-//const json = std.json;
 const gltf = @import("./gltf.zig");
+const json = gltf.json;
 
 //const ParseOverride = struct {
 //    pub fn overridesType(comptime T: type) bool {

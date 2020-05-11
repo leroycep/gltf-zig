@@ -1,5 +1,5 @@
 const std = @import("std");
-const json = @import("./json.zig");
+pub const json = @import("./json.zig");
 const StringHashMap = std.StringHashMap;
 
 fn Map(comptime T: type) type {

@@ -1233,7 +1233,7 @@ pub const Value = union(enum) {
     Array: Array,
     Object: ObjectMap,
 
-    pub fn jsonParse(token: Token, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) !Value {
+    pub fn jsonParse(token: Token, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) ParseError!Value {
         var levels: usize = 0;
         switch (token) {
             .ObjectBegin, .ArrayBegin => levels += 1,
@@ -1416,20 +1416,18 @@ pub const ParseErrorInfo = union(enum) {
     },
 };
 
-fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) !T {
-    //@compileLog(T);
-    //if (comptime options.parse_override) |override| {
-    //    if (comptime override.overridesType(T)) {
-    //        return override.parseJson(T, token, tokens, options);
-    //    }
-    //}
-    //const Tinfo = @typeInfo(T);
-    //if (Tinfo == .Union) {
-    //    @compileLog(@hasDecl(T, "jsonParse"));
-    //    inline for (Tinfo.Union.decls) |decl| {
-    //        @compileLog("   ", decl.name, decl.data);
-    //    }
-    //}
+pub const ParseError = error{
+    UnexpectedToken,
+    UnknownField,
+    MissingField,
+    DuplicateJSONField,
+    AllocatorRequired,
+    OutOfMemory,
+    Overflow,
+    InvalidCharacter,
+} || TokenStream.Error || std.meta.IntToEnumError;
+
+fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) ParseError!T {
     if (comptime std.meta.trait.hasFn("jsonParse")(T)) {
         return T.jsonParse(token, tokens, options, parseErrorInfo);
     }
@@ -1514,57 +1512,54 @@ fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: 
             }
             var r: T = undefined;
             var fields_seen = [_]bool{false} ** structInfo.fields.len;
-            errdefer {
+
+            const err: ParseError!void = tokenloop: {
+                while (true) {
+                    switch ((try tokens.next()) orelse return error.UnexpectedEndOfJson) {
+                        .ObjectEnd => break,
+                        .String => |stringToken| {
+                            const key_source_slice = stringToken.slice(tokens.slice, tokens.i - 1);
+                            var found = false;
+                            inline for (structInfo.fields) |field, i| {
+                                // TODO: using switches here segfault the compiler (#2727?)
+                                if ((stringToken.escapes == .None and mem.eql(u8, field.name, key_source_slice)) or (stringToken.escapes == .Some and (field.name.len == stringToken.decodedLength() and encodesTo(field.name, key_source_slice)))) {
+                                    if (fields_seen[i]) {
+                                        if (options.duplicate_field_behavior == .UseFirst) {
+                                            break;
+                                        } else if (options.duplicate_field_behavior == .Error) {
+                                            return error.DuplicateJSONField;
+                                        } else if (options.duplicate_field_behavior == .UseLast) {
+                                            parseFree(field.field_type, @field(r, field.name), options);
+                                        }
+                                    }
+                                    @field(r, field.name) = parse(field.field_type, tokens, options, parseErrorInfo) catch |e| break :tokenloop e;
+                                    fields_seen[i] = true;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                if (parseErrorInfo) |info| {
+                                    info.* = .{ .UnknownField = .{ .name = key_source_slice, .pos = tokens.i - 1 } };
+                                }
+                                break :tokenloop error.UnknownField;
+                            }
+                        },
+                        else => break :tokenloop error.UnexpectedToken,
+                    }
+                }
+            };
+
+            // Check to see if there was an error while looping over the tokens
+            err catch |e| {
                 inline for (structInfo.fields) |field, i| {
                     if (fields_seen[i]) {
                         parseFree(field.field_type, @field(r, field.name), options);
                     }
                 }
-            }
+                return e;
+            };
 
-            while (true) {
-                switch ((try tokens.next()) orelse return error.UnexpectedEndOfJson) {
-                    .ObjectEnd => break,
-                    .String => |stringToken| {
-                        const key_source_slice = stringToken.slice(tokens.slice, tokens.i - 1);
-                        var found = false;
-                        inline for (structInfo.fields) |field, i| {
-                            // TODO: using switches here segfault the compiler (#2727?)
-                            if ((stringToken.escapes == .None and mem.eql(u8, field.name, key_source_slice)) or (stringToken.escapes == .Some and (field.name.len == stringToken.decodedLength() and encodesTo(field.name, key_source_slice)))) {
-                                // if (switch (stringToken.escapes) {
-                                //     .None => mem.eql(u8, field.name, key_source_slice),
-                                //     .Some => (field.name.len == stringToken.decodedLength() and encodesTo(field.name, key_source_slice)),
-                                // }) {
-                                if (fields_seen[i]) {
-                                    // switch (options.duplicate_field_behavior) {
-                                    //     .UseFirst => {},
-                                    //     .Error => {},
-                                    //     .UseLast => {},
-                                    // }
-                                    if (options.duplicate_field_behavior == .UseFirst) {
-                                        break;
-                                    } else if (options.duplicate_field_behavior == .Error) {
-                                        return error.DuplicateJSONField;
-                                    } else if (options.duplicate_field_behavior == .UseLast) {
-                                        parseFree(field.field_type, @field(r, field.name), options);
-                                    }
-                                }
-                                @field(r, field.name) = try parse(field.field_type, tokens, options, parseErrorInfo);
-                                fields_seen[i] = true;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            if (parseErrorInfo) |info| {
-                                info.* = .{ .UnknownField = .{ .name = key_source_slice, .pos = tokens.i - 1 } };
-                            }
-                            return error.UnknownField;
-                        }
-                    },
-                    else => return error.UnexpectedToken,
-                }
-            }
             inline for (structInfo.fields) |field, i| {
                 if (!fields_seen[i]) {
                     if (field.default_value) |default| {
@@ -1615,7 +1610,6 @@ fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: 
         },
         .Pointer => |ptrInfo| {
             const allocator = options.allocator orelse return error.AllocatorRequired;
-            //@compileLog(T, @TypeOf(allocator));
             switch (ptrInfo.size) {
                 .One => {
                     const r: T = allocator.create(ptrInfo.child);
@@ -1670,7 +1664,7 @@ fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: 
     unreachable;
 }
 
-pub fn parse(comptime T: type, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) !T {
+pub fn parse(comptime T: type, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) ParseError!T {
     const token = (try tokens.next()) orelse return error.UnexpectedEndOfJson;
     return parseInternal(T, token, tokens, options, parseErrorInfo);
 }

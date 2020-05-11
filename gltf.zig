@@ -6,7 +6,7 @@ fn Map(comptime T: type) type {
     return struct {
         map: StringHashMap(T),
 
-        pub fn jsonParse(token: json.Token, tokens: *json.TokenStream, options: json.ParseOptions, parseErrorInfo: ?*json.ParseErrorInfo) !@This() {
+        pub fn jsonParse(token: json.Token, tokens: *json.TokenStream, options: json.ParseOptions, parseErrorInfo: ?*json.ParseErrorInfo) json.ParseError!@This() {
             const allocator = options.allocator orelse return error.AllocatorRequired;
             var attribs = StringHashMap(T).init(allocator);
             errdefer attribs.deinit();

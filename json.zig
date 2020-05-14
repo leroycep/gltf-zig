@@ -1222,6 +1222,73 @@ pub const ValueTree = struct {
 pub const ObjectMap = StringHashMap(Value);
 pub const Array = ArrayList(Value);
 
+pub fn DeserializeMap(comptime T: type) type {
+    return struct {
+        map: StringHashMap(T),
+
+        pub fn jsonParse(token: Token, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) ParseError!@This() {
+            const allocator = options.allocator orelse return error.AllocatorRequired;
+            var attribs = StringHashMap(T).init(allocator);
+            errdefer attribs.deinit();
+
+            switch (token) {
+                .ObjectBegin => {},
+                else => return error.UnexpectedToken,
+            }
+
+            while (true) {
+                switch ((try tokens.next()) orelse return error.UnexpectedEndOfJson) {
+                    .ObjectEnd => return @This(){ .map = attribs },
+                    .String => |stringToken| {
+                        const source_slice = stringToken.slice(tokens.slice, tokens.i - 1);
+                        const property_name = switch (stringToken.escapes) {
+                            .None => try std.mem.dupe(allocator, u8, source_slice),
+                            .Some => |some_escapes| unescaping: {
+                                const output = try allocator.alloc(u8, stringToken.decodedLength());
+                                errdefer allocator.free(output);
+                                try unescapeString(output, source_slice);
+                                break :unescaping output;
+                            },
+                        };
+
+                        const property_val = try parse(T, tokens, options, parseErrorInfo);
+
+                        switch (options.duplicate_field_behavior) {
+                            .UseFirst => {
+                                var gop = try attribs.getOrPut(property_name);
+                                if (gop.found_existing) {
+                                    allocator.free(property_name);
+                                    parseFree(T, property_val, options);
+                                } else {
+                                    gop.kv.value = property_val;
+                                }
+                            },
+                            .Error => if (try attribs.put(property_name, property_val)) |prev_val| {
+                                return error.DuplicateJSONField;
+                            },
+                            .UseLast => if (try attribs.put(property_name, property_val)) |prev| {
+                                allocator.free(prev.key);
+                                parseFree(T, prev.value, options);
+                            },
+                        }
+                    },
+                    else => return error.UnexpectedToken,
+                }
+            }
+        }
+
+        pub fn jsonParseFree(self: @This(), options: ParseOptions) void {
+            var iter = self.map.iterator();
+            while (iter.next()) |kv| {
+                parseFree(T, kv.value, options);
+                if (options.allocator) |alloc| {
+                    alloc.free(kv.key);
+                }
+            }
+            self.map.deinit();
+        }
+    };
+}
 /// Represents a JSON value
 /// Currently only supports numbers that fit into i64 or f64.
 pub const Value = union(enum) {
@@ -1236,7 +1303,15 @@ pub const Value = union(enum) {
     pub fn jsonParse(token: Token, tokens: *TokenStream, options: ParseOptions, parseErrorInfo: ?*ParseErrorInfo) ParseError!Value {
         var levels: usize = 0;
         switch (token) {
-            .ObjectBegin, .ArrayBegin => levels += 1,
+            .ObjectBegin => {
+                const map = try parseInternal(DeserializeMap(Value), token, tokens, options, parseErrorInfo);
+                return Value{ .Object = map.map };
+            },
+            .ArrayBegin => {
+                const alloc = options.allocator orelse return error.AllocatorRequired;
+                const list = try parseInternal([]Value, token, tokens, options, parseErrorInfo);
+                return Value{ .Array = Array.fromOwnedSlice(alloc, list) };
+            },
             .String => |stringToken| {
                 const allocator = options.allocator orelse return error.AllocatorRequired;
                 const source_slice = stringToken.slice(tokens.slice, tokens.i - 1);
@@ -1250,30 +1325,19 @@ pub const Value = union(enum) {
                     },
                 }
             },
-            .Number, .True, .False, .Null, .ObjectEnd, .ArrayEnd => return error.UnexpectedToken,
-            else => return error.UnexpectedToken,
+            .Number => |numberToken| {
+                const source_slice = numberToken.slice(tokens.slice, tokens.i - 1);
+                if (numberToken.is_integer) {
+                    return Value{ .Integer = try std.fmt.parseInt(i64, source_slice, 10) };
+                } else {
+                    return Value{ .Float = try std.fmt.parseFloat(f64, source_slice) };
+                }
+            },
+            .True => return Value{ .Bool = true },
+            .False => return Value{ .Bool = false },
+            .Null => return Value{ .Null = {} },
+            .ObjectEnd, .ArrayEnd => return error.UnexpectedToken,
         }
-
-        //const valuetree = try parser.parse(tokens.slice[tokens.i..]);
-        while (true) {
-            switch ((try tokens.next()) orelse return error.UnexpectedEndOfJson) {
-                .ObjectEnd, .ArrayEnd => {
-                    levels -= 1;
-                    if (levels == 0) {
-                        break;
-                    }
-                },
-                .String => |stringToken| {
-                    switch ((try tokens.next()) orelse return error.UnexpectedEndOfJson) {
-                        .ObjectBegin, .ArrayBegin => levels += 1,
-                        .ObjectEnd, .ArrayEnd => return error.UnexpectedToken,
-                        else => {},
-                    }
-                },
-                else => return error.UnexpectedToken,
-            }
-        }
-        return Value{ .Null = .{} };
     }
 
     pub fn jsonParseFree(self: @This(), options: ParseOptions) void {}
